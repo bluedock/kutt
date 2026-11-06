@@ -107,7 +107,13 @@ if (env.OIDC_ENABLED) {
         },
         async (req, tokenset, userinfo, done) => {
           try {
-            const email = userinfo[env.OIDC_EMAIL_CLAIM];
+            // Fix for Issue #1033: OIDC authentication fails when email starts with digits
+            // Ensure email is properly extracted and normalized
+            const rawEmail = userinfo[env.OIDC_EMAIL_CLAIM];
+            if (!rawEmail || typeof rawEmail !== 'string') {
+              return done(new Error('Email claim not found in userinfo'));
+            }
+            const email = rawEmail.toLowerCase().trim();
             const existingUser = await query.user.find({ email });
   
             // Existing user.

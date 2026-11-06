@@ -12,6 +12,7 @@ const query = require("../queries");
 const queue = require("../queues");
 const utils = require("../utils");
 const env = require("../env");
+const redis = require("../redis");
 
 const CustomError = utils.CustomError;
 const dnsLookup = promisify(dns.lookup);
@@ -160,10 +161,11 @@ async function create(req, res) {
     .send(utils.sanitize.link({ ...link }));
 }
 
-async function edit(req, res) {
+// Common edit logic extracted to avoid duplication
+async function editLink(req, res, isAdmin = false) {
   const link = await query.link.find({
     uuid: req.params.id,
-    ...(!req.user.admin && { user_id: req.user.id })
+    ...(!req.user.admin && !isAdmin && { user_id: req.user.id })
   });
 
   if (!link) {
@@ -241,110 +243,28 @@ async function edit(req, res) {
     }
   );
 
+  const template = isAdmin ? "partials/admin/links/edit" : "partials/links/edit";
+  const sanitize = isAdmin ? utils.sanitize.link_admin : utils.sanitize.link_html;
+
   if (req.isHTML) {
-    res.render("partials/links/edit", {
+    res.render(template, {
       swap_oob: true,
       success: "Link has been updated.",
-      ...utils.sanitize.link_html({ ...updatedLink }),
+      ...sanitize({ ...updatedLink }),
     });
     return;
   }
 
   return res.status(200).send(utils.sanitize.link({ ...updatedLink }));
-};
+}
+
+async function edit(req, res) {
+  return editLink(req, res, false);
+}
 
 async function editAdmin(req, res) {
-  const link = await query.link.find({
-    uuid: req.params.id,
-    ...(!req.user.admin && { user_id: req.user.id })
-  });
-
-  if (!link) {
-    throw new CustomError("Link was not found.");
-  }
-
-  let isChanged = false;
-  [
-    [req.body.address, "address"], 
-    [req.body.target, "target"], 
-    [req.body.description, "description"], 
-    [req.body.expire_in, "expire_in"], 
-    [req.body.password, "password"]
-  ].forEach(([value, name]) => {
-    if (!value) {
-      if (name === "password" && link.password) 
-        req.body.password = null;
-      else {
-        delete req.body[name];
-        return;
-      }
-    }
-    if (value === link[name] && name !== "password") {
-      delete req.body[name];
-      return;
-    }
-    if (name === "expire_in" && link.expire_in)
-      if (Math.abs(differenceInSeconds(utils.parseDatetime(value), utils.parseDatetime(link.expire_in))) < 60)
-          return;
-    if (name === "password")
-      if (value && value.replace(/•/ig, "").length === 0) {
-        delete req.body.password;
-        return;
-      }
-    isChanged = true;
-  });
-
-  if (!isChanged) {
-    throw new CustomError("Should at least update one field.");
-  }
-
-  const { address, target, description, expire_in, password } = req.body;
-  
-  const targetDomain = target && utils.removeWww(URL.parse(target).hostname);
-  const domain_id = link.domain_id || null;
-
-  const tasks = await Promise.all([
-    address &&
-      query.link.find({
-        address,
-        domain_id
-      }),
-    target && validators.bannedDomain(targetDomain),
-    target && validators.bannedHost(targetDomain)
-  ]);
-
-  // Check if custom link already exists
-  if (tasks[0]) {
-    const error = "Custom URL is already in use.";
-    res.locals.errors = { address: error };
-    throw new CustomError("Custom URL is already in use.");
-  }
-
-  // Update link
-  const [updatedLink] = await query.link.update(
-    {
-      id: link.id
-    },
-    {
-      ...(address && { address }),
-      ...(description && { description }),
-      ...(target && { target }),
-      ...(expire_in && { expire_in }),
-      ...((password || password === null) && { password })
-    }
-  );
-
-  if (req.isHTML) {
-    res.render("partials/admin/links/edit", {
-      swap_oob: true,
-      success: "Link has been updated.",
-      ...utils.sanitize.link_admin({ ...updatedLink }),
-    });
-    return;
-  }
-
-  return res.status(200).send(utils.sanitize.link({ ...updatedLink }));
-};
+  return editLink(req, res, true);
+}
 
 async function remove(req, res) {
   const { error, isRemoved, link } = await query.link.remove({
@@ -504,6 +424,58 @@ async function redirect(req, res, next) {
 
   // 6. If link is protected, redirect to password page
   if (link.password) {
+    // Rate limiting for password verification (Issue #1062)
+    // Use Redis if available, otherwise in-memory (less effective but better than nothing)
+    const clientIp = req.ip || req.connection?.remoteAddress || 'unknown';
+    const rateLimitKey = `pwd_verify:${link.uuid}:${clientIp}`;
+    const MAX_ATTEMPTS = 5;
+    const WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+    
+    let attempts = 0;
+    let resetTime = Date.now() + WINDOW_MS;
+    
+    if (env.REDIS_ENABLED && redis?.client?.status === 'ready') {
+      try {
+        const redisClient = redis.client;
+        const current = await redisClient.get(rateLimitKey);
+        if (current) {
+          const data = JSON.parse(current);
+          attempts = data.attempts || 0;
+          resetTime = data.resetTime || resetTime;
+        }
+        
+        if (attempts >= MAX_ATTEMPTS) {
+          const retryAfter = Math.ceil((resetTime - Date.now()) / 1000);
+          res.set('Retry-After', retryAfter.toString());
+          return res.status(429).render("protected", {
+            title: "Too Many Attempts",
+            id: link.uuid,
+            error: `Too many failed attempts. Please try again in ${Math.ceil(retryAfter / 60)} minutes.`
+          });
+        }
+      } catch (e) {
+        // Redis error, fall back to in-memory
+        console.warn('Redis rate limit check failed:', e.message);
+      }
+    } else {
+      // In-memory fallback (per-process, not shared across workers)
+      if (!global.passwordAttemptCache) global.passwordAttemptCache = new Map();
+      const cached = global.passwordAttemptCache.get(rateLimitKey);
+      if (cached) {
+        attempts = cached.attempts;
+        resetTime = cached.resetTime;
+      }
+      if (attempts >= MAX_ATTEMPTS) {
+        const retryAfter = Math.ceil((resetTime - Date.now()) / 1000);
+        res.set('Retry-After', retryAfter.toString());
+        return res.status(429).render("protected", {
+          title: "Too Many Attempts",
+          id: link.uuid,
+          error: `Too many failed attempts. Please try again in ${Math.ceil(retryAfter / 60)} minutes.`
+        });
+      }
+    }
+
     if ("authorization" in req.headers) {
       const auth = req.headers.authorization;
       const firstSpace = auth.indexOf(" ");
@@ -516,6 +488,26 @@ async function redirect(req, res, next) {
           if (colon !== -1) {
             const password = decoded.slice(colon + 1);
             const matches = await bcrypt.compare(password, link.password);
+            
+            // Update rate limit counter
+            if (env.REDIS_ENABLED && redis?.client?.status === 'ready') {
+              try {
+                const redisClient = redis.client;
+                const ttl = Math.ceil((resetTime - Date.now()) / 1000);
+                if (matches) {
+                  await redisClient.del(rateLimitKey);
+                } else {
+                  await redisClient.setex(rateLimitKey, ttl, JSON.stringify({ attempts: attempts + 1, resetTime }));
+                }
+              } catch (e) { /* ignore */ }
+            } else if (global.passwordAttemptCache) {
+              if (matches) {
+                global.passwordAttemptCache.delete(rateLimitKey);
+              } else {
+                global.passwordAttemptCache.set(rateLimitKey, { attempts: attempts + 1, resetTime });
+              }
+            }
+            
             if (matches) return res.redirect(link.target);
           }
         }
@@ -554,8 +546,69 @@ async function redirectProtected(req, res) {
     throw new CustomError("Couldn't find the link.", 400);
   }
 
+  // Rate limiting for password verification (Issue #1062)
+  const clientIp = req.ip || req.connection?.remoteAddress || 'unknown';
+  const rateLimitKey = `pwd_verify:${link.uuid}:${clientIp}`;
+  const MAX_ATTEMPTS = 5;
+  const WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+  
+  let attempts = 0;
+  let resetTime = Date.now() + WINDOW_MS;
+  
+  if (env.REDIS_ENABLED && redis?.client?.status === 'ready') {
+    try {
+      const redisClient = redis.client;
+      const current = await redisClient.get(rateLimitKey);
+      if (current) {
+        const data = JSON.parse(current);
+        attempts = data.attempts || 0;
+        resetTime = data.resetTime || resetTime;
+      }
+      
+      if (attempts >= MAX_ATTEMPTS) {
+        const retryAfter = Math.ceil((resetTime - Date.now()) / 1000);
+        res.set('Retry-After', retryAfter.toString());
+        throw new CustomError(`Too many failed attempts. Please try again in ${Math.ceil(retryAfter / 60)} minutes.`, 429);
+      }
+    } catch (e) {
+      if (e.statusCode === 429) throw e;
+      console.warn('Redis rate limit check failed:', e.message);
+    }
+  } else {
+    if (!global.passwordAttemptCache) global.passwordAttemptCache = new Map();
+    const cached = global.passwordAttemptCache.get(rateLimitKey);
+    if (cached) {
+      attempts = cached.attempts;
+      resetTime = cached.resetTime;
+    }
+    if (attempts >= MAX_ATTEMPTS) {
+      const retryAfter = Math.ceil((resetTime - Date.now()) / 1000);
+      res.set('Retry-After', retryAfter.toString());
+      throw new CustomError(`Too many failed attempts. Please try again in ${Math.ceil(retryAfter / 60)} minutes.`, 429);
+    }
+  }
+
   // 3. Check if password matches
   const matches = await bcrypt.compare(req.body.password, link.password);
+  
+  // Update rate limit counter
+  if (env.REDIS_ENABLED && redis?.client?.status === 'ready') {
+    try {
+      const redisClient = redis.client;
+      const ttl = Math.ceil((resetTime - Date.now()) / 1000);
+      if (matches) {
+        await redisClient.del(rateLimitKey);
+      } else {
+        await redisClient.setex(rateLimitKey, ttl, JSON.stringify({ attempts: attempts + 1, resetTime }));
+      }
+    } catch (e) { /* ignore */ }
+  } else if (global.passwordAttemptCache) {
+    if (matches) {
+      global.passwordAttemptCache.delete(rateLimitKey);
+    } else {
+      global.passwordAttemptCache.set(rateLimitKey, { attempts: attempts + 1, resetTime });
+    }
+  }
 
   if (!matches) {
     throw new CustomError("Password is not correct.", 401);

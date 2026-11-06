@@ -70,6 +70,7 @@ const spec = {
   OIDC_SCOPE: str({ default: "openid profile email" }),
   OIDC_EMAIL_CLAIM: str({ default: "email" }),
   OIDC_BUTTON_TEXT: str({ default: "Log in with OIDC" }),
+  OIDC_ID_TOKEN_ALG: str({ default: "RS256" }), // Supports RS256, ES256, etc.
   ENABLE_RATE_LIMIT: bool({ default: false }),
   REPORT_EMAIL: str({ default: "" }),
   CONTACT_EMAIL: str({ default: "" }),

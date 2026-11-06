@@ -31,6 +31,21 @@ async function login(req, res) {
 
 function logout(req, res) {
   utils.deleteCurrentToken(res);
+  
+  // OIDC RP-initiated logout (Issue #1054)
+  // If user logged in via OIDC, redirect to OP's logout endpoint
+  if (env.OIDC_ENABLED && req.user && req.user.oidc_id_token) {
+    const { Issuer } = require("openid-client");
+    // We need to get the issuer from the client config
+    // For now, redirect to the standard OIDC logout endpoint
+    const logoutUrl = `${env.OIDC_ISSUER}/protocol/openid-connect/logout?` + 
+      new URLSearchParams({
+        post_logout_redirect_uri: utils.getSiteURL(),
+        id_token_hint: req.user.oidc_id_token,
+      }).toString();
+    return res.redirect(logoutUrl);
+  }
+  
   res.render("logout", {
     title: "Logging out.."
   });

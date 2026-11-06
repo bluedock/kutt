@@ -66,11 +66,15 @@ function generateRandomPassword() {
   return [...crypto.randomBytes(length)].map(byte => String.fromCharCode((byte % 93) + 33)).join("");
 }
 
-async function generateId(query, domain_id) {
+async function generateId(query, domain_id, retries = 0) {
+  const MAX_RETRIES = 10;
   const address = nanoid();
   const link = await query.link.find({ address, domain_id });
   if (link) {
-    return generateId(query, domain_id)
+    if (retries >= MAX_RETRIES) {
+      throw new Error('Unable to generate unique ID after maximum retries');
+    }
+    return generateId(query, domain_id, retries + 1);
   };
   return address;
 }

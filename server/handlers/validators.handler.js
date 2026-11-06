@@ -26,8 +26,16 @@ const createLink = [
     .isLength({ min: 1, max: 2040 })
     .withMessage("Maximum URL length is 2040.")
     .customSanitizer(utils.addProtocol)
-    .custom(value => utils.urlRegex.test(value) || /^(?!https?|ftp)(\w+:|\/\/)/.test(value))
-    .withMessage("URL is not valid.")
+    .custom(value => {
+      // Block dangerous protocols
+      const dangerousProtocols = /^(javascript|data|vbscript|file|about|blob|filesystem):/i;
+      if (dangerousProtocols.test(value)) {
+        return false;
+      }
+      // Allow only http, https, ftp and relative URLs
+      return utils.urlRegex.test(value) || /^(https?|ftp):\/\//i.test(value) || /^\/\//.test(value);
+    })
+    .withMessage("URL is not valid. Only HTTP, HTTPS, FTP and protocol-relative URLs are allowed.")
     .custom(value => utils.removeWww(URL.parse(value).host) !== env.DEFAULT_DOMAIN)
     .withMessage(`${env.DEFAULT_DOMAIN} URLs are not allowed.`),
   body("password")
@@ -105,8 +113,16 @@ const editLink = [
     .isLength({ min: 1, max: 2040 })
     .withMessage("Maximum URL length is 2040.")
     .customSanitizer(utils.addProtocol)
-    .custom(value => utils.urlRegex.test(value) || /^(?!https?|ftp)(\w+:|\/\/)/.test(value))
-    .withMessage("URL is not valid.")
+    .custom(value => {
+      // Block dangerous protocols
+      const dangerousProtocols = /^(javascript|data|vbscript|file|about|blob|filesystem):/i;
+      if (dangerousProtocols.test(value)) {
+        return false;
+      }
+      // Allow only http, https, ftp and relative URLs
+      return utils.urlRegex.test(value) || /^(https?|ftp):\/\//i.test(value) || /^\/\//.test(value);
+    })
+    .withMessage("URL is not valid. Only HTTP, HTTPS, FTP and protocol-relative URLs are allowed.")
     .custom(value => utils.removeWww(URL.parse(value).host) !== env.DEFAULT_DOMAIN)
     .withMessage(`${env.DEFAULT_DOMAIN} URLs are not allowed.`),
   body("password")
@@ -169,7 +185,15 @@ const addDomain = [
     .withMessage("Domain length must be between 3 and 64.")
     .trim()
     .customSanitizer(utils.addProtocol)
-    .custom(value => utils.urlRegex.test(value))
+    .custom(value => {
+      // Block dangerous protocols for domain too
+      const dangerousProtocols = /^(javascript|data|vbscript|file|about|blob|filesystem):/i;
+      if (dangerousProtocols.test(value)) {
+        return false;
+      }
+      return utils.urlRegex.test(value);
+    })
+    .withMessage("Domain is not valid.")
     .customSanitizer(value => {
       const parsed = URL.parse(value);
       return utils.removeWww(parsed.hostname || parsed.href);
@@ -195,7 +219,15 @@ const addDomainAdmin = [
     .withMessage("Domain length must be between 3 and 64.")
     .trim()
     .customSanitizer(utils.addProtocol)
-    .custom(value => utils.urlRegex.test(value))
+    .custom(value => {
+      // Block dangerous protocols for domain too
+      const dangerousProtocols = /^(javascript|data|vbscript|file|about|blob|filesystem):/i;
+      if (dangerousProtocols.test(value)) {
+        return false;
+      }
+      return utils.urlRegex.test(value);
+    })
+    .withMessage("Domain is not valid.")
     .customSanitizer(value => {
       const parsed = URL.parse(value);
       return utils.removeWww(parsed.hostname || parsed.href);
@@ -512,11 +544,35 @@ async function bannedDomain(domain) {
   }
 };
 
+// DNS lookup cache to prevent DoS from repeated lookups
+const dnsCache = new Map();
+const DNS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
 async function bannedHost(domain) {
   let isBanned;
 
   try {
+    // Check cache first
+    const cached = dnsCache.get(domain);
+    if (cached && Date.now() < cached.expiresAt) {
+      if (!cached.address) return;
+      isBanned = await query.host.find({
+        address: cached.address,
+        banned: true
+      });
+      if (isBanned) {
+        throw new utils.CustomError("URL is containing malware/scam.", 400);
+      }
+      return;
+    }
+
     const dnsRes = await dnsLookup(domain);
+
+    // Cache the result (even if null)
+    dnsCache.set(domain, {
+      address: dnsRes?.address || null,
+      expiresAt: Date.now() + DNS_CACHE_TTL
+    });
 
     if (!dnsRes || !dnsRes.address) return;
 
@@ -525,7 +581,12 @@ async function bannedHost(domain) {
       banned: true
     });
   } catch (error) {
-    isBanned = null;
+    // Cache negative result to avoid repeated failed lookups
+    dnsCache.set(domain, {
+      address: null,
+      expiresAt: Date.now() + DNS_CACHE_TTL
+    });
+    return;
   }
 
   if (isBanned) {
